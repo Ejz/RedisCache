@@ -1,6 +1,6 @@
 {
     "name": "ejz/rediscache",
-    "description": "Fast cache on Redis storage!",
+    "description": "ejz/rediscache",
     "keywords": ["ejz", "redis", "cache"],
     "license": "WTFPL",
     "repositories": [
