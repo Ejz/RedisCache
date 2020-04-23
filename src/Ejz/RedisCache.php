@@ -105,7 +105,35 @@ class RedisCache
     {
         $result = $this->multiple($keys, self::SCRIPT_TAGS_MULTIPLE, true);
         $result = array_map(function ($value) {
-            return $value === 0 ? null : $value;
+            return is_array($value) ? $value : null;
+        }, $result);
+        return $result;
+    }
+
+    /**
+     * @param string $key
+     *
+     * @return ?array
+     *
+     * @throws RedisCacheException
+     */
+    public function links(string $key): ?array
+    {
+        return $this->linksMultiple([$key])[$key];
+    }
+
+    /**
+     * @param array $keys
+     *
+     * @return array
+     *
+     * @throws RedisCacheException
+     */
+    public function linksMultiple(array $keys): array
+    {
+        $result = $this->multiple($keys, self::SCRIPT_LINKS_MULTIPLE, true);
+        $result = array_map(function ($value) {
+            return is_array($value) ? $value : null;
         }, $result);
         return $result;
     }
@@ -140,28 +168,31 @@ class RedisCache
      * @param mixed  $value
      * @param int    $ttl   (optional)
      * @param array  $tags  (optional)
+     * @param array  $links (optional)
      *
      * @throws RedisCacheException
      */
-    public function set(string $key, $value, int $ttl = 0, array $tags = [])
+    public function set(string $key, $value, int $ttl = 0, array $tags = [], array $links = [])
     {
-        $this->setMultiple([$key => $value], $ttl, $tags);
+        $this->setMultiple([$key => $value], $ttl, $tags, $links);
     }
 
     /**
      * @param array $values
      * @param int   $ttl    (optional)
      * @param array $tags   (optional)
+     * @param array $links  (optional)
      *
      * @throws RedisCacheException
      */
-    public function setMultiple(array $values, int $ttl = 0, array $tags = [])
+    public function setMultiple(array $values, int $ttl = 0, array $tags = [], array $links = [])
     {
         $keys = array_keys($values);
         $this->setMultipleComplex(
             $values,
             array_fill_keys($keys, $ttl),
-            array_fill_keys($keys, $tags)
+            array_fill_keys($keys, $tags),
+            array_fill_keys($keys, $links)
         );
     }
 
@@ -169,10 +200,11 @@ class RedisCache
      * @param array $values
      * @param array $ttls
      * @param array $tags
+     * @param array $links
      *
      * @throws RedisCacheException
      */
-    public function setMultipleComplex(array $values, array $ttls, array $tags)
+    public function setMultipleComplex(array $values, array $ttls, array $tags, array $links)
     {
         $c = count($values);
         if (!$c) {
@@ -182,11 +214,18 @@ class RedisCache
             return array_unique(array_values($tags));
         }, $tags);
         array_walk($tags, [$this, 'validateTags']);
+        $links = array_map(function ($links) {
+            return array_unique(array_values($links));
+        }, $links);
+        array_walk($links, [$this, 'validateKeys']);
         $keys = array_keys($values);
         $this->validateKeys($keys);
         $args = [];
-        foreach ($tags as $_) {
-            array_push($args, count($_), ...$_);
+        foreach ($keys as $key) {
+            $t = $tags[$key];
+            $l = $links[$key];
+            array_push($args, count($t), ...$t);
+            array_push($args, count($l), ...$l);
         }
         $this->client->EVAL(
             self::SCRIPT_SET_MULTIPLE_COMPLEX,
@@ -244,19 +283,6 @@ class RedisCache
             ...$args
         );
     }
-
-    // /**
-    //  * @param string ...$tags
-    //  *
-    //  * @return bool
-    //  *
-    //  * @throws RedisCacheException
-    //  */
-    // public function drop(...$tags): bool
-    // {
-    //     $keys = $this->search(...$tags);
-    //     return $this->deleteMultiple($keys);
-    // }
 
     /**
      * @param mixed $key
@@ -342,10 +368,16 @@ class RedisCache
     private const SCRIPT_GET_MULTIPLE = '
         local nkeys = #KEYS
         local prefix_key_value = ARGV[2]
+        local ret = {}
+        local iret = 1
         for i = 1, nkeys do
-            KEYS[i] = prefix_key_value .. KEYS[i]
+            ret[iret] = redis.call("GET", prefix_key_value .. KEYS[i])
+            if ret[iret] and ret[iret]:sub(1, 1) == "l" then
+                ret[iret] = redis.call("GET", prefix_key_value .. ret[iret]:sub(2))
+            end
+            iret = iret + 1
         end
-        return redis.call("MGET", unpack(KEYS))
+        return ret
     ';
 
     /**
@@ -356,11 +388,13 @@ class RedisCache
         local prefix_tag = ARGV[1]
         local prefix_key_value = ARGV[2]
         local prefix_key_tags = ARGV[3]
+        local prefix_key_links = ARGV[4]
         local pointer = nkeys + nkeys + 5
         for i = 1, nkeys do
             local key = KEYS[i]
             local kv = prefix_key_value .. key
             local kt = prefix_key_tags .. key
+            local kl = prefix_key_links .. key
             local v = ARGV[i + 4]
             local t = tonumber(ARGV[i + nkeys + 4])
             local args = {"SET", kv, v}
@@ -369,24 +403,50 @@ class RedisCache
                 args[5] = t
             end
             redis.call(unpack(args))
+            --
+            local n
+            local links = redis.call("SMEMBERS", kl)
+            local nlinks = #links
+            for j = 1, nlinks do
+                redis.call("DEL", prefix_key_value .. links[j])
+            end
+            redis.call("DEL", kl)
             local tags = redis.call("SMEMBERS", kt)
-            redis.call("DEL", kt)
             local ntags = #tags
+            redis.call("DEL", kt)
             for j = 1, ntags do
                 redis.call("SREM", prefix_tag .. tags[j], key)
             end
             tags = {}
             local itags = 1
-            local n = tonumber(ARGV[pointer])
+            n = tonumber(ARGV[pointer])
             for j = 1, n do
                 tags[itags] = ARGV[pointer + j]
                 itags = itags + 1
+            end
+            pointer = pointer + n + 1
+            links = {}
+            local ilinks = 1
+            n = tonumber(ARGV[pointer])
+            for j = 1, n do
+                links[ilinks] = ARGV[pointer + j]
+                ilinks = ilinks + 1
             end
             pointer = pointer + n + 1
             if itags > 1 then
                 redis.call("SADD", kt, unpack(tags))
                 for j = 1, itags - 1 do
                     redis.call("SADD", prefix_tag .. tags[j], key)
+                end
+            end
+            if ilinks > 1 then
+                redis.call("SADD", kl, unpack(links))
+                for j = 1, ilinks - 1 do
+                    local old = redis.call("GETRANGE", prefix_key_value .. links[j], 1, -1)
+                    if old ~= "" and old ~= key then
+                        redis.call("SREM", prefix_key_links .. old, links[j])
+                    end
+                    redis.call("SET", prefix_key_value .. links[j], "l" .. key)
                 end
             end
         end
@@ -453,6 +513,29 @@ class RedisCache
             local kt = prefix_key_tags .. KEYS[i]
             if redis.call("EXISTS", kv) == 1 then
                 ret[iret] = redis.call("SMEMBERS", kt)
+                iret = iret + 1
+            else
+                ret[iret] = 0
+                iret = iret + 1
+            end
+        end
+        return ret
+    ';
+
+    /**
+     * SCRIPT_LINKS_MULTIPLE
+     */
+    private const SCRIPT_LINKS_MULTIPLE = '
+        local nkeys = #KEYS
+        local prefix_key_value = ARGV[2]
+        local prefix_key_links = ARGV[4]
+        local ret = {}
+        local iret = 1
+        for i = 1, nkeys do
+            local kv = prefix_key_value .. KEYS[i]
+            local kl = prefix_key_links .. KEYS[i]
+            if redis.call("EXISTS", kv) == 1 then
+                ret[iret] = redis.call("SMEMBERS", kl)
                 iret = iret + 1
             else
                 ret[iret] = 0

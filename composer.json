@@ -1,7 +1,7 @@
 {
     "name": "ejz/rediscache",
-    "description": "ejz/rediscache",
-    "keywords": ["ejz", "redis", "cache"],
+    "description": "",
+    "keywords": [],
     "license": "WTFPL",
     "repositories": [
         {
