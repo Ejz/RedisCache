@@ -2,29 +2,21 @@
 
 namespace Ejz;
 
-use Ejz\RedisClient;
-use Psr\SimpleCache\CacheInterface;
-
-class RedisCache implements CacheInterface
+class RedisCache
 {
     /**
      * PREFIXES
      */
-    private const PREFIX_SHARD     = 's_';
     private const PREFIX_TAG       = 't_';
     private const PREFIX_KEY_VALUE = 'kv_';
     private const PREFIX_KEY_TAGS  = 'kt_';
-
-    /**
-     * Number of shards.
-     */
-    private const SHARDS = 1000;
+    private const PREFIX_KEY_LINKS = 'kl_';
 
     /** @var RedisClient */
     private $client;
 
-    /** @var string */
-    private $prefix;
+    /** @var array */
+    private $prefixes;
 
     /**
      * @param RedisClient $client
@@ -33,7 +25,12 @@ class RedisCache implements CacheInterface
     public function __construct(RedisClient $client, string $prefix = '')
     {
         $this->client = $client;
-        $this->prefix = $prefix;
+        $this->prefixes = [
+            'tag' => $prefix . self::PREFIX_TAG,
+            'key_value' => $prefix . self::PREFIX_KEY_VALUE,
+            'key_tags' => $prefix . self::PREFIX_KEY_TAGS,
+            'key_links' => $prefix . self::PREFIX_KEY_LINKS,
+        ];
     }
 
     /**
@@ -44,209 +41,166 @@ class RedisCache implements CacheInterface
      *
      * @throws RedisCacheException
      */
-    public function get($key, $default = null)
+    public function get(string $key, $default = null)
     {
         return $this->getMultiple([$key], $default)[$key];
     }
 
     /**
-     * @param iterable $keys
-     * @param mixed    $default (optional)
+     * @param array $keys
+     * @param mixed $default (optional)
      *
      * @return array
      *
      * @throws RedisCacheException
      */
-    public function getMultiple($keys, $default = null): array
+    public function getMultiple(array $keys, $default = null): array
     {
-        if (!is_iterable($keys)) {
-            throw new RedisCacheException('Argument $keys is not iterable.');
-        }
-        if (!count($keys)) {
-            return [];
-        }
-        $keys = array_unique($keys);
-        $this->validateKeys($keys);
-        $args = array_map(function ($key) {
-            return self::PREFIX_KEY_VALUE . $key;
-        }, $keys);
-        $values = $this->client->MGET(...$args);
-        $values = array_map(function ($value) use ($default) {
+        $result = $this->multiple($keys, self::SCRIPT_GET_MULTIPLE, true);
+        return array_map(function ($value) use ($default) {
             return $value === null ? $default : $this->unpack($value);
-        }, $values);
-        return array_combine($keys, $values);
-    }
-
-    /**
-     * @param string                $key
-     * @param mixed                 $value
-     * @param DateInterval|int|null $ttl   (optional)
-     * @param array                 $tags  (optional)
-     *
-     * @return bool
-     *
-     * @throws RedisCacheException
-     */
-    public function set($key, $value, $ttl = null, array $tags = []): bool
-    {
-        return $this->setMultiple([$key => $value], $ttl, $tags);
-    }
-
-    /**
-     * @param iterable              $values
-     * @param DateInterval|int|null $ttl    (optional)
-     * @param array                 $tags   (optional)
-     *
-     * @return bool
-     *
-     * @throws RedisCacheException
-     */
-    public function setMultiple($values, $ttl = null, array $tags = []): bool
-    {
-        if (!is_iterable($values)) {
-            throw new RedisCacheException('Argument $values is not iterable.');
-        }
-        if (!count($values)) {
-            return true;
-        }
-        $this->validateTags($tags);
-        $keys = array_keys($values);
-        $this->deleteMultiple($keys);
-        if ($ttl instanceof \DateInterval) {
-            $expire = (new \DateTime('now'))->add($ttl)->getTimeStamp() - time();
-        } elseif (is_int($ttl) || ctype_digit($ttl)) {
-            $expire = $ttl;
-        } else {
-            $expire = 0;
-        }
-        if ($expire < 0) {
-            return false;
-        }
-        $args = [];
-        foreach ($values as $key => $value) {
-            $args[] = self::PREFIX_KEY_VALUE . $key;
-            $args[] = $this->pack($value);
-        }
-        $this->client->MSET(...$args);
-        if ($expire) {
-            $this->client->EVAL(
-                self::SCRIPT_SET_EXPIRE,
-                count($keys),
-                ...$keys,
-                ...[$expire, self::PREFIX_KEY_VALUE]
-            );
-        }
-        $tags = array_unique(array_values($tags));
-        if (count($tags)) {
-            $this->client->EVAL(
-                self::SCRIPT_SET_TAGS,
-                count($keys),
-                ...$keys,
-                ...$tags,
-                ...[self::PREFIX_KEY_TAGS, self::PREFIX_TAG]
-            );
-        }
-        $args = [[], []];
-        foreach ($keys as $key) {
-            $args[0][] = $key;
-            $args[1][] = crc32($key) % self::SHARDS;
-        }
-        $this->client->EVAL(
-            self::SCRIPT_SET_SHARDS,
-            count($args[0]),
-            ...$args[0],
-            ...$args[1],
-            ...[self::PREFIX_SHARD]
-        );
-        return true;
+        }, $result);
     }
 
     /**
      * @param string $key
      *
-     * @return bool
-     *
      * @throws RedisCacheException
      */
-    public function delete($key): bool
+    public function delete(string $key)
     {
-        return $this->deleteMultiple([$key]);
+        $this->deleteMultiple([$key]);
     }
 
     /**
-     * @param iterable $keys
-     *
-     * @return bool
+     * @param array $keys
      *
      * @throws RedisCacheException
      */
-    public function deleteMultiple($keys): bool
+    public function deleteMultiple(array $keys)
     {
-        if (!is_iterable($keys)) {
-            throw new RedisCacheException('Argument $keys is not iterable.');
-        }
-        if (!count($keys)) {
-            return true;
-        }
-        $keys = array_unique($keys);
-        $this->validateKeys($keys);
-        $this->client->EVAL(
-            self::SCRIPT_DELETE,
-            count($keys),
-            ...$keys,
-            ...[self::PREFIX_TAG, self::PREFIX_KEY_TAGS]
-        );
-        $this->client->DEL(
-            ...array_map(function ($key) {
-                return self::PREFIX_KEY_VALUE . $key;
-            }, $keys),
-            ...array_map(function ($key) {
-                return self::PREFIX_KEY_TAGS . $key;
-            }, $keys)
-        );
-        return true;
+        $this->multiple($keys, self::SCRIPT_DELETE_MULTIPLE, false);
     }
 
     /**
      * @param string $key
      *
-     * @return bool
+     * @return ?array
      *
      * @throws RedisCacheException
      */
-    public function has($key): bool
+    public function tags(string $key): ?array
     {
-        return $this->hasMultiple([$key])[$key];
+        return $this->tagsMultiple([$key])[$key];
     }
 
     /**
-     * @param itetable $keys
+     * @param array $keys
      *
      * @return array
      *
      * @throws RedisCacheException
      */
-    public function hasMultiple($keys): array
+    public function tagsMultiple(array $keys): array
     {
-        if (!is_iterable($keys)) {
-            throw new RedisCacheException('Argument $keys is not iterable.');
-        }
+        $result = $this->multiple($keys, self::SCRIPT_TAGS_MULTIPLE, true);
+        $result = array_map(function ($value) {
+            return $value === 0 ? null : $value;
+        }, $result);
+        return $result;
+    }
+
+    /**
+     * @param array  $keys
+     * @param string $script
+     * @param bool   $combine
+     *
+     * @return ?array
+     *
+     * @throws RedisCacheException
+     */
+    private function multiple(array $keys, string $script, bool $combine): ?array
+    {
         if (!count($keys)) {
             return [];
         }
-        $keys = array_unique($keys);
+        $keys = array_unique(array_values($keys));
         $this->validateKeys($keys);
         $result = $this->client->EVAL(
-            self::SCRIPT_HAS,
+            $script,
             count($keys),
             ...$keys,
-            ...[self::PREFIX_KEY_VALUE]
+            ...array_values($this->prefixes)
         );
-        return array_combine($keys, array_map('boolval', $result));
+        return $combine ? array_combine($keys, $result) : null;
     }
 
     /**
-     * @param string ...$tags
+     * @param string $key
+     * @param mixed  $value
+     * @param int    $ttl   (optional)
+     * @param array  $tags  (optional)
+     *
+     * @throws RedisCacheException
+     */
+    public function set(string $key, $value, int $ttl = 0, array $tags = [])
+    {
+        $this->setMultiple([$key => $value], $ttl, $tags);
+    }
+
+    /**
+     * @param array $values
+     * @param int   $ttl    (optional)
+     * @param array $tags   (optional)
+     *
+     * @throws RedisCacheException
+     */
+    public function setMultiple(array $values, int $ttl = 0, array $tags = [])
+    {
+        $keys = array_keys($values);
+        $this->setMultipleComplex(
+            $values,
+            array_fill_keys($keys, $ttl),
+            array_fill_keys($keys, $tags)
+        );
+    }
+
+    /**
+     * @param array $values
+     * @param array $ttls
+     * @param array $tags
+     *
+     * @throws RedisCacheException
+     */
+    public function setMultipleComplex(array $values, array $ttls, array $tags)
+    {
+        $c = count($values);
+        if (!$c) {
+            return;
+        }
+        $tags = array_map(function ($tags) {
+            return array_unique(array_values($tags));
+        }, $tags);
+        array_walk($tags, [$this, 'validateTags']);
+        $keys = array_keys($values);
+        $this->validateKeys($keys);
+        $args = [];
+        foreach ($tags as $_) {
+            array_push($args, count($_), ...$_);
+        }
+        $this->client->EVAL(
+            self::SCRIPT_SET_MULTIPLE_COMPLEX,
+            $c,
+            ...$keys,
+            ...array_values($this->prefixes),
+            ...array_values(array_map([$this, 'pack'], $values)),
+            ...array_values($ttls),
+            ...$args
+        );
+    }
+
+    /**
+     * @param array ...$tags
      *
      * @return array
      *
@@ -254,160 +208,55 @@ class RedisCache implements CacheInterface
      */
     public function search(...$tags): array
     {
-        $this->validateTags($tags);
         if (!count($tags)) {
             return [];
         }
+        $this->validateTags($tags);
         $tags = array_unique($tags);
-        $tags = array_map(function ($tag) {
-            return self::PREFIX_TAG . $tag;
-        }, $tags);
-        $return = $this->client->EVAL(
-            self::SCRIPT_SEARCH,
+        $args = array_values($this->prefixes);
+        array_push($args, __FUNCTION__);
+        return $this->client->EVAL(
+            self::SCRIPT_SEARCH_DROP,
             count($tags),
             ...$tags,
-            ...[
-                self::PREFIX_TAG,
-                self::PREFIX_KEY_VALUE,
-                self::PREFIX_KEY_TAGS,
-            ]
+            ...$args
         );
-        return $return ?: [];
     }
 
     /**
-     * @param string ...$tags
-     *
-     * @return bool
+     * @param array ...$tags
      *
      * @throws RedisCacheException
      */
-    public function drop(...$tags): bool
+    public function drop(...$tags)
     {
-        $keys = $this->search(...$tags);
-        return $this->deleteMultiple($keys);
-    }
-
-    /**
-     * @param string $key
-     *
-     * @return array|null
-     *
-     * @throws RedisCacheException
-     */
-    public function getTags($key): ?array
-    {
-        return $this->getTagsMultiple([$key])[$key];
-    }
-
-    /**
-     * @param array $keys
-     *
-     * @return array
-     *
-     * @throws RedisCacheException
-     */
-    public function getTagsMultiple(array $keys): array
-    {
-        if (!is_iterable($keys)) {
-            throw new RedisCacheException('Argument $keys is not iterable.');
-        }
-        if (!count($keys)) {
+        if (!count($tags)) {
             return [];
         }
-        $keys = array_unique($keys);
-        $this->validateKeys($keys);
-        $return = $this->client->EVAL(
-            self::SCRIPT_GET_TAGS,
-            count($keys),
-            ...$keys,
-            ...[
-                self::PREFIX_KEY_VALUE,
-                self::PREFIX_KEY_TAGS,
-            ]
+        $this->validateTags($tags);
+        $tags = array_unique($tags);
+        $args = array_values($this->prefixes);
+        array_push($args, __FUNCTION__);
+        $this->client->EVAL(
+            self::SCRIPT_SEARCH_DROP,
+            count($tags),
+            ...$tags,
+            ...$args
         );
-        return array_map(function ($value) {
-            return $value === 0 ? null : $value;
-        }, array_combine($keys, $return));
     }
 
-    /**
-     * @param string $key
-     *
-     * @return int|null
-     *
-     * @throws RedisCacheException
-     */
-    public function getTtl($key): ?int
-    {
-        return $this->getTtlMultiple([$key])[$key];
-    }
-
-    /**
-     * @param array $keys
-     *
-     * @return array
-     *
-     * @throws RedisCacheException
-     */
-    public function getTtlMultiple(array $keys): array
-    {
-        if (!is_iterable($keys)) {
-            throw new RedisCacheException('Argument $keys is not iterable.');
-        }
-        if (!count($keys)) {
-            return [];
-        }
-        $keys = array_unique($keys);
-        $this->validateKeys($keys);
-        $return = $this->client->EVAL(
-            self::SCRIPT_GET_TTL,
-            count($keys),
-            ...$keys,
-            ...[
-                self::PREFIX_KEY_VALUE,
-            ]
-        );
-        return array_map(function ($value) {
-            $value = (int)$value;
-            if ($value === -1) {
-                return 0;
-            }
-            if ($value === -2 || $value === 0) {
-                return null;
-            }
-            return $value;
-        }, array_combine($keys, $return));
-    }
-
-    /**
-     * @return \Generator
-     */
-    public function all(): \Generator
-    {
-        foreach (range(0, self::SHARDS - 1) as $shard) {
-            $keys = $this->client->EVAL(
-                self::SCRIPT_ALL,
-                0,
-                ...[
-                    self::PREFIX_SHARD . $shard,
-                    self::PREFIX_KEY_VALUE,
-                ]
-            );
-            yield from $keys;
-        }
-    }
-
-    /**
-     * @return bool
-     */
-    public function clear(): bool
-    {
-        foreach ($this->all() as $key) {
-            $this->delete($key);
-        }
-        return true;
-    }
+    // /**
+    //  * @param string ...$tags
+    //  *
+    //  * @return bool
+    //  *
+    //  * @throws RedisCacheException
+    //  */
+    // public function drop(...$tags): bool
+    // {
+    //     $keys = $this->search(...$tags);
+    //     return $this->deleteMultiple($keys);
+    // }
 
     /**
      * @param mixed $key
@@ -425,11 +274,11 @@ class RedisCache implements CacheInterface
     }
 
     /**
-     * @param iterable $keys
+     * @param array $keys
      *
      * @throws RedisCacheException
      */
-    private function validateKeys(iterable $keys)
+    private function validateKeys(array $keys)
     {
         array_walk($keys, [$this, 'validateKey']);
     }
@@ -450,11 +299,11 @@ class RedisCache implements CacheInterface
     }
 
     /**
-     * @param iterable $tags
+     * @param array $tags
      *
      * @throws RedisCacheException
      */
-    private function validateTags(iterable $tags)
+    private function validateTags(array $tags)
     {
         array_walk($tags, [$this, 'validateTag']);
     }
@@ -488,101 +337,127 @@ class RedisCache implements CacheInterface
     }
 
     /**
-     * SCRIPTS
+     * SCRIPT_GET_MULTIPLE
      */
-    private const SCRIPT_SET_EXPIRE = '
-        local expire = ARGV[1]
+    private const SCRIPT_GET_MULTIPLE = '
+        local nkeys = #KEYS
         local prefix_key_value = ARGV[2]
-        for _, key in ipairs(KEYS) do
-            redis.call("EXPIRE", prefix_key_value .. key, expire)
+        for i = 1, nkeys do
+            KEYS[i] = prefix_key_value .. KEYS[i]
         end
+        return redis.call("MGET", unpack(KEYS))
     ';
-    private const SCRIPT_SET_TAGS = '
-        local prefix_tag = table.remove(ARGV)
-        local prefix_key_tags = table.remove(ARGV)
-        for _, key in ipairs(KEYS) do
-            redis.call("SADD", prefix_key_tags .. key, unpack(ARGV))
-        end
-        for _, tag in ipairs(ARGV) do
-            redis.call("SADD", prefix_tag .. tag, unpack(KEYS))
-        end
-    ';
-    private const SCRIPT_SET_SHARDS = '
-        local tag_all = table.remove(ARGV)
-        for i, key in ipairs(KEYS) do
-            redis.call("SADD", tag_all .. ARGV[i], key)
-        end
-    ';
-    private const SCRIPT_DELETE = '
-        local prefix_tag = ARGV[1]
-        local prefix_key_tags = ARGV[2]
-        for _, key in ipairs(KEYS) do
-            local tags = redis.call("SMEMBERS", prefix_key_tags .. key)
-            for _, tag in ipairs(tags) do
-                redis.call("SREM", prefix_tag .. tag, key)
-            end
-        end
-    ';
-    private const SCRIPT_HAS = '
-        local ret = {}
-        local prefix_key_value = ARGV[1]
-        for _, key in ipairs(KEYS) do
-            table.insert(ret, redis.call("EXISTS", prefix_key_value .. key))
-        end
-        return ret
-    ';
-    private const SCRIPT_SEARCH = '
-        local ret = {}
-        local tags = {}
+
+    /**
+     * SCRIPT_SET_MULTIPLE_COMPLEX
+     */
+    private const SCRIPT_SET_MULTIPLE_COMPLEX = '
+        local nkeys = #KEYS
         local prefix_tag = ARGV[1]
         local prefix_key_value = ARGV[2]
         local prefix_key_tags = ARGV[3]
-        local keys = redis.call("SINTER", unpack(KEYS))
-        for _, key in ipairs(keys) do
-            if redis.call("EXISTS", prefix_key_value .. key) == 1 then
-                table.insert(ret, key)
-            else
-                tags = redis.call("SMEMBERS", prefix_key_tags .. key)
-                for _, tag in ipairs(tags) do
-                    redis.call("SREM", prefix_tag .. tag, key)
+        local pointer = nkeys + nkeys + 5
+        for i = 1, nkeys do
+            local key = KEYS[i]
+            local kv = prefix_key_value .. key
+            local kt = prefix_key_tags .. key
+            local v = ARGV[i + 4]
+            local t = tonumber(ARGV[i + nkeys + 4])
+            local args = {"SET", kv, v}
+            if t > 0 then
+                args[4] = "EX"
+                args[5] = t
+            end
+            redis.call(unpack(args))
+            local tags = redis.call("SMEMBERS", kt)
+            redis.call("DEL", kt)
+            local ntags = #tags
+            for j = 1, ntags do
+                redis.call("SREM", prefix_tag .. tags[j], key)
+            end
+            tags = {}
+            local itags = 1
+            local n = tonumber(ARGV[pointer])
+            for j = 1, n do
+                tags[itags] = ARGV[pointer + j]
+                itags = itags + 1
+            end
+            pointer = pointer + n + 1
+            if itags > 1 then
+                redis.call("SADD", kt, unpack(tags))
+                for j = 1, itags - 1 do
+                    redis.call("SADD", prefix_tag .. tags[j], key)
                 end
-                redis.call("DEL", prefix_key_tags .. key)
             end
         end
-        return ret
     ';
-    private const SCRIPT_ALL = '
-        local ret = {}
-        local shard = ARGV[1]
+
+    /**
+     * SCRIPT_SEARCH
+     */
+    private const SCRIPT_SEARCH_DROP = '
+        local nkeys = #KEYS
+        local prefix_tag = ARGV[1]
         local prefix_key_value = ARGV[2]
-        local keys = redis.call("SMEMBERS", shard)
-        for _, key in ipairs(keys) do
-            if redis.call("EXISTS", prefix_key_value .. key) == 1 then
-                table.insert(ret, key)
+        local prefix_key_tags = ARGV[3]
+        local is_search = ARGV[5] == "search"
+        for i = 1, nkeys do
+            KEYS[i] = prefix_tag .. KEYS[i]
+        end
+        local keys = redis.call("SINTER", unpack(KEYS))
+        nkeys = #keys
+        local ret = {}
+        local iret = 1
+        for i = 1, nkeys do
+            local key = keys[i]
+            if is_search and redis.call("EXISTS", prefix_key_value .. key) == 1 then
+                ret[iret] = key
+                iret = iret + 1
             else
-                redis.call("SREM", shard, key)
+                local tags = redis.call("SMEMBERS", prefix_key_tags .. key)
+                redis.call("DEL", prefix_key_tags .. key)
+                local ntags = #tags
+                for j = 1, ntags do
+                    redis.call("SREM", prefix_tag .. tags[j], key)
+                end
+                if not is_search then
+                    redis.call("DEL", prefix_key_value .. key)
+                end
             end
         end
         return ret
     ';
-    private const SCRIPT_GET_TAGS = '
-        local ret = {}
-        local prefix_key_value = ARGV[1]
-        local prefix_key_tags = ARGV[2]
-        for _, key in ipairs(KEYS) do
-            if redis.call("EXISTS", prefix_key_value .. key) == 1 then
-                table.insert(ret, redis.call("SMEMBERS", prefix_key_tags .. key))
-            else
-                table.insert(ret, 0)
-            end
+
+    /**
+     * SCRIPT_DELETE_MULTIPLE
+     */
+    private const SCRIPT_DELETE_MULTIPLE = '
+        local nkeys = #KEYS
+        local prefix_key_value = ARGV[2]
+        for i = 1, nkeys do
+            redis.call("DEL", prefix_key_value .. KEYS[i])
         end
-        return ret
     ';
-    private const SCRIPT_GET_TTL = '
+
+    /**
+     * SCRIPT_TAGS_MULTIPLE
+     */
+    private const SCRIPT_TAGS_MULTIPLE = '
+        local nkeys = #KEYS
+        local prefix_key_value = ARGV[2]
+        local prefix_key_tags = ARGV[3]
         local ret = {}
-        local prefix_key_value = ARGV[1]
-        for _, key in ipairs(KEYS) do
-            table.insert(ret, redis.call("TTL", prefix_key_value .. key))
+        local iret = 1
+        for i = 1, nkeys do
+            local kv = prefix_key_value .. KEYS[i]
+            local kt = prefix_key_tags .. KEYS[i]
+            if redis.call("EXISTS", kv) == 1 then
+                ret[iret] = redis.call("SMEMBERS", kt)
+                iret = iret + 1
+            else
+                ret[iret] = 0
+                iret = iret + 1
+            end
         end
         return ret
     ';
