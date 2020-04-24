@@ -34,6 +34,14 @@ class RedisCache
     }
 
     /**
+     * @return RedisClient
+     */
+    public function getClient(): RedisClient
+    {
+        return $this->client;
+    }
+
+    /**
      * @param string $key
      * @param mixed  $default (optional)
      *
