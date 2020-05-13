@@ -133,8 +133,9 @@ class TestRedisCache extends TestCase
         $this->assertTrue($c->links('foo') === ['l1']);
         //
         $c->setMultiple(['k1' => 'v1', 'k2' => 'v2'], 0, [], ['l1']);
-        $this->assertTrue($c->links('k1') === ['l1']);
+        $this->assertTrue($c->links('k1') === []);
         $this->assertTrue($c->links('k2') === ['l1']);
+        $this->assertTrue($c->get('l1') === 'v2');
         //
         $c->setMultipleComplex([
             'k3' => 'v1',

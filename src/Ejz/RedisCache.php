@@ -255,19 +255,31 @@ class RedisCache
      */
     public function search(...$tags): array
     {
-        if (!count($tags)) {
-            return [];
-        }
-        $this->validateTags($tags);
-        $tags = array_unique($tags);
-        $args = array_values($this->prefixes);
-        array_push($args, __FUNCTION__);
-        return $this->client->EVAL(
-            self::SCRIPT_SEARCH_DROP,
-            count($tags),
-            ...$tags,
-            ...$args
-        );
+        return $this->searchInter(...$tags);
+    }
+
+    /**
+     * @param array ...$tags
+     *
+     * @return array
+     *
+     * @throws RedisCacheException
+     */
+    public function searchInter(...$tags): array
+    {
+        return $this->executeSearchDrop('search', 'SINTER', ...$tags);
+    }
+
+    /**
+     * @param array ...$tags
+     *
+     * @return array
+     *
+     * @throws RedisCacheException
+     */
+    public function searchUnion(...$tags): array
+    {
+        return $this->executeSearchDrop('search', 'SUNION', ...$tags);
     }
 
     /**
@@ -277,14 +289,49 @@ class RedisCache
      */
     public function drop(...$tags)
     {
+        $this->dropInter(...$tags);
+    }
+
+    /**
+     * @param array ...$tags
+     *
+     * @throws RedisCacheException
+     */
+    public function dropInter(...$tags)
+    {
+        $this->executeSearchDrop('drop', 'SINTER', ...$tags);
+    }
+
+    /**
+     * @param array ...$tags
+     *
+     * @throws RedisCacheException
+     */
+    public function dropUnion(...$tags)
+    {
+        $this->executeSearchDrop('drop', 'SUNION', ...$tags);
+    }
+
+    /**
+     * @param string $function
+     * @param string $command
+     * @param array  ...$tags
+     *
+     * @return array
+     *
+     * @throws RedisCacheException
+     */
+    private function executeSearchDrop(string $function, string $command, ...$tags)
+    {
         if (!count($tags)) {
             return [];
         }
         $this->validateTags($tags);
         $tags = array_unique($tags);
         $args = array_values($this->prefixes);
-        array_push($args, __FUNCTION__);
-        $this->client->EVAL(
+        array_push($args, $function);
+        array_push($args, $command);
+        return $this->client->EVAL(
             self::SCRIPT_SEARCH_DROP,
             count($tags),
             ...$tags,
@@ -469,10 +516,11 @@ class RedisCache
         local prefix_key_value = ARGV[2]
         local prefix_key_tags = ARGV[3]
         local is_search = ARGV[5] == "search"
+        local call = ARGV[6]
         for i = 1, nkeys do
             KEYS[i] = prefix_tag .. KEYS[i]
         end
-        local keys = redis.call("SINTER", unpack(KEYS))
+        local keys = redis.call(call, unpack(KEYS))
         nkeys = #keys
         local ret = {}
         local iret = 1
